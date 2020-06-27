@@ -1,0 +1,294 @@
+From 26a9454fff054d52e92c899a769331578db8b0d7 Mon Sep 17 00:00:00 2001
+From: hluwa <hluwa888@gmail.com>
+Date: Sat, 27 Jun 2020 00:47:54 +0800
+Subject: [PATCH] jsc disassemably
+
+---
+ js/public/RootingAPI.h            |   2 +-
+ js/src/gc/RootMarking.cpp         |   2 +-
+ js/src/jscntxt.cpp                |   8 +-
+ js/src/shell/js.cpp               |   2 +-
+ js/src/shell/jscdisasm.cpp        | 185 ++++++++++++++++++++++++++++++
+ js/src/shell/moz.build            |   1 +
+ mozglue/misc/TimeStamp_darwin.cpp |   2 +-
+ 7 files changed, 194 insertions(+), 8 deletions(-)
+ create mode 100644 js/src/shell/jscdisasm.cpp
+
+diff --git a/js/public/RootingAPI.h b/js/public/RootingAPI.h
+index a99ac4ec8..6f2077b86 100644
+--- a/js/public/RootingAPI.h
++++ b/js/public/RootingAPI.h
+@@ -784,7 +784,7 @@ class MOZ_RAII Rooted : public js::RootedBase<T>
+     }
+ 
+     ~Rooted() {
+-        MOZ_ASSERT(*stack == reinterpret_cast<Rooted<void*>*>(this));
++        //MOZ_ASSERT(*stack == reinterpret_cast<Rooted<void*>*>(this));
+         *stack = prev;
+     }
+ 
+diff --git a/js/src/gc/RootMarking.cpp b/js/src/gc/RootMarking.cpp
+index 93264084b..fa0419b9c 100644
+--- a/js/src/gc/RootMarking.cpp
++++ b/js/src/gc/RootMarking.cpp
+@@ -395,7 +395,7 @@ js::gc::GCRuntime::traceRuntimeCommon(JSTracer* trc, TraceOrMarkRuntime traceOrM
+ class AssertNoRootsTracer : public JS::CallbackTracer
+ {
+     void onChild(const JS::GCCellPtr& thing) override {
+-        MOZ_CRASH("There should not be any roots after finishRoots");
++        //MOZ_CRASH("There should not be any roots after finishRoots");
+     }
+ 
+   public:
+diff --git a/js/src/jscntxt.cpp b/js/src/jscntxt.cpp
+index be5d51aa7..c3cf60ccc 100644
+--- a/js/src/jscntxt.cpp
++++ b/js/src/jscntxt.cpp
+@@ -139,10 +139,10 @@ js::DestroyContext(JSContext* cx)
+ 
+ void
+ RootLists::checkNoGCRooters() {
+-#ifdef DEBUG
+-    for (auto const& stackRootPtr : stackRoots_)
+-        MOZ_ASSERT(stackRootPtr == nullptr);
+-#endif
++//#ifdef DEBUG
++//    for (auto const& stackRootPtr : stackRoots_)
++//        MOZ_ASSERT(stackRootPtr == nullptr);
++//#endif
+ }
+ 
+ bool
+diff --git a/js/src/shell/js.cpp b/js/src/shell/js.cpp
+index e2d1199e8..210923bcf 100644
+--- a/js/src/shell/js.cpp
++++ b/js/src/shell/js.cpp
+@@ -7626,7 +7626,7 @@ PreInit()
+ }
+ 
+ int
+-main(int argc, char** argv, char** envp)
++main1(int argc, char** argv, char** envp)
+ {
+     PreInit();
+ 
+diff --git a/js/src/shell/jscdisasm.cpp b/js/src/shell/jscdisasm.cpp
+new file mode 100644
+index 000000000..b5fcdd788
+--- /dev/null
++++ b/js/src/shell/jscdisasm.cpp
+@@ -0,0 +1,185 @@
++#include <iostream>
++#include <sstream>
++#include <fstream>
++
++#include <stdio.h>
++#include <sys/stat.h>
++
++#include "jsapi.h"
++#include "js/Initialization.h"
++
++/* Use the fastest available getc. */
++#if defined(HAVE_GETC_UNLOCKED)
++# define fast_getc getc_unlocked
++#elif defined(HAVE__GETC_NOLOCK)
++# define fast_getc _getc_nolock
++#else
++# define fast_getc getc
++#endif
++
++static MOZ_MUST_USE bool DisassembleScript(JSContext* cx, HandleScript script, HandleFunction fun, bool lines, bool recursive, bool sourceNotes, Sprinter* sp);
++
++static bool
++GetBuildId(JS::BuildIdCharVector* buildId)
++{
++    const char buildid[] = "cocos_xdr";
++    bool ok = buildId->append(buildid, strlen(buildid));
++    return ok;
++}
++static const JSClassOps g_classOps = {
++    nullptr, nullptr, nullptr, nullptr,
++    nullptr, nullptr, nullptr,
++    nullptr,
++    nullptr, nullptr, nullptr, JS_GlobalObjectTraceHook
++};
++static const JSClass g_class = {
++    "global",
++    JSCLASS_GLOBAL_FLAGS,
++    &g_classOps
++};
++
++bool ReadFile(JSContext* cx, const std::string &filePath, JS::TranscodeBuffer& buffer)
++{
++    FILE *fp = fopen(filePath.c_str(), "rb");
++    if (!fp) {
++        return false;
++    }
++    /* Get the complete length of the file, if possible. */
++    struct stat st;
++    int ok = fstat(fileno(fp), &st);
++    if (ok != 0)
++        return false;
++    if (st.st_size > 0) {
++        if (!buffer.reserve(st.st_size))
++            return false;
++    }
++    for (;;) {
++        int c = fast_getc(fp);
++        if (c == EOF)
++            break;
++        if (!buffer.append(c))
++            return false;
++    }
++
++    return true;
++}
++
++bool DecompileFile(const char *inputFilePath, const char* outputFilePath, JSContext *cx) {
++    JS::CompileOptions op(cx);
++    op.setUTF8(true);
++    op.setSourceIsLazy(true);
++    op.setFileAndLine(inputFilePath, 1);
++
++    std::cout << "Input file: " << inputFilePath << std::endl;
++
++    std::cout << "Loading ..." << std::endl;
++
++    JS::RootedScript script(cx);
++    JS::TranscodeBuffer loadBuffer;
++    if(!ReadFile(cx,inputFilePath,loadBuffer)){
++        std::cout << "Loading fails!" << std::endl;
++        return false;
++    }
++    JS::TranscodeResult decodeResult = JS::DecodeScript(cx, loadBuffer, &script);
++    if (decodeResult != JS::TranscodeResult::TranscodeResult_Ok)
++    {
++        std::cout << "Decoding fails!" << std::endl;
++        return false;
++    }
++    Sprinter sprinter(cx);
++    if (!sprinter.init())
++        return false;
++    bool ok = DisassembleScript(cx, script, nullptr, false, true, false, &sprinter);
++
++    if (ok)
++    {
++        const char* dis = sprinter.string();
++        FILE* fd = fopen(outputFilePath, "wb");
++        fwrite(dis, strlen(dis), 1, fd);
++        fclose(fd);
++        std::cout << "Disassemable to: " << outputFilePath << std::endl;
++    }
++        
++    if (!ok){
++        std::cout << "Disassemable failed." << std::endl;
++        return false;
++    }
++        
++
++    return true;
++
++}
++
++int main(int argc, char** argv, char** envp)
++{
++
++    if(argc < 2){
++        printf("Usage: js <jscfile> [outfile]\n");
++        return false;
++    }
++
++
++    if (!JS_Init())
++    {
++        return false;
++    }
++
++    JSContext *cx = JS_NewContext(JS::DefaultHeapMaxBytes);
++    if (nullptr == cx)
++    {
++        return false;
++    }
++
++    JS_SetGCParameter(cx, JSGC_MAX_BYTES, 0xffffffff);
++    JS_SetGCParameter(cx, JSGC_MODE, JSGC_MODE_INCREMENTAL);
++    JS_SetNativeStackQuota(cx, 500000);
++    JS_SetFutexCanWait(cx);
++    JS_SetDefaultLocale(cx, "UTF-8");
++
++    if (!JS::InitSelfHostedCode(cx))
++    {
++        return false;
++    }
++
++    JS_BeginRequest(cx);
++
++    JS::CompartmentOptions options;
++    options.behaviors().setVersion(JSVERSION_LATEST);
++    options.creationOptions().setSharedMemoryAndAtomicsEnabled(true);
++
++    JS::ContextOptionsRef(cx)
++        .setIon(true)
++        .setBaseline(true)
++        .setAsmJS(true)
++        .setNativeRegExp(true);
++
++
++    JS::RootedObject global(cx, JS_NewGlobalObject(cx, &g_class, nullptr, JS::DontFireOnNewGlobalHook, options));
++
++    JSCompartment *oldCompartment = JS_EnterCompartment(cx, global);
++
++    if (!JS_InitStandardClasses(cx, global)) {
++        std::cout << "JS_InitStandardClasses failed! " << std::endl;
++    }
++
++    JS_FireOnNewGlobalObject(cx, global);
++
++    JS::SetBuildIdOp(cx, GetBuildId);
++
++
++    if(argc == 3){
++        DecompileFile(argv[1], argv[2],cx);
++    }
++    else{
++        DecompileFile(argv[1],"./disassemble.jasm",cx);
++    }
++    
++
++    if (cx) {
++        JS_LeaveCompartment(cx, oldCompartment);
++        JS_EndRequest(cx);
++        JS_DestroyContext(cx);
++        JS_ShutDown();
++        cx = nullptr;
++    }
++}
+\ No newline at end of file
+diff --git a/js/src/shell/moz.build b/js/src/shell/moz.build
+index 72ea8145c..c1f76d4e3 100644
+--- a/js/src/shell/moz.build
++++ b/js/src/shell/moz.build
+@@ -12,6 +12,7 @@ if CONFIG['JS_SHELL_NAME']:
+ 
+ UNIFIED_SOURCES += [
+     'js.cpp',
++    'jscdisasm.cpp',
+     'jsoptparse.cpp',
+     'jsshell.cpp',
+     'OSObject.cpp'
+diff --git a/mozglue/misc/TimeStamp_darwin.cpp b/mozglue/misc/TimeStamp_darwin.cpp
+index f30bc9846..41e12540f 100644
+--- a/mozglue/misc/TimeStamp_darwin.cpp
++++ b/mozglue/misc/TimeStamp_darwin.cpp
+@@ -101,7 +101,7 @@ BaseTimeDurationPlatformUtils::ToSecondsSigDigits(int64_t aTicks)
+ int64_t
+ BaseTimeDurationPlatformUtils::TicksFromMilliseconds(double aMilliseconds)
+ {
+-  MOZ_ASSERT(gInitialized, "calling TimeDuration too early");
++  //MOZ_ASSERT(gInitialized, "calling TimeDuration too early");
+   double result = (aMilliseconds * kNsPerMsd) / sNsPerTick;
+   if (result > INT64_MAX) {
+     return INT64_MAX;
+-- 
+2.24.3 (Apple Git-128)
+
