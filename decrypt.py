@@ -38,6 +38,7 @@ def main(path, key, force=False):
 
         content = open(target, "rb").read()
         if key:
+            key=bytes(key,encoding='utf-8')
             content = xxtea.decrypt(content, key)
 
         if content[:2] == b'\037\213':
